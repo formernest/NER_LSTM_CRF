@@ -24,11 +24,6 @@ print("train len:", len(x_train))
 print("test len:", len(x_test))
 print("valid len", len(x_valid))
 
-x_train = x_train[:100]
-y_train = y_train[:100]
-
-x_test = x_test[:20]
-y_test = y_test[:20]
 #############
 START_TAG = "<START>"
 STOP_TAG = "<STOP>"
