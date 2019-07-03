@@ -30,47 +30,26 @@ STOP_TAG = "<STOP>"
 EMBEDDING_DIM = 100  # 嵌入层维度
 HIDDEN_DIM = 200  # 隐藏层数量
 EPOCHS = 5    # 迭代几次
-steps = 30    # 每次迭代需要几轮
 
 tag2id[START_TAG] = len(tag2id)
 tag2id[STOP_TAG] = len(tag2id)  # 将START_TAG和STOP_TAG加入tag字典中
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print("device:", device)
 
 def train():
 
-    model = BiLSTM_CRF(len(word2id) + 1, tag2id, EMBEDDING_DIM, HIDDEN_DIM).to(device)  # 实例化模型
-
+    model = BiLSTM_CRF(len(word2id) + 1, tag2id, EMBEDDING_DIM, HIDDEN_DIM)  # 实例化模型
     optimizer = optim.SGD(model.parameters(), lr=0.005, weight_decay=1e-4)  # 随机梯度下降优化算法
-
-    # train_data
-    sentence = torch.tensor(x_train, dtype=torch.long).to(device)
-    y_train1 = [[tag2id[y_train[i][j]] for j in range(len(y_train[i]))] for i in range(len(y_train))]
-    tags = torch.tensor(y_train1, dtype=torch.long).to(device)
-    trainloader = DataLoader(TensorDataset(sentence, tags), shuffle=True)
-
-    # test_data
-    sentence = torch.tensor(x_test, dtype=torch.long).to(device)
-    y_test1 = [[tag2id[y_test[i][j]] for j in range(len(y_test[i]))] for i in range(len(y_test))]
-    tags = torch.tensor(y_test1, dtype=torch.long).to(device)
-    testloader = DataLoader(TensorDataset(sentence, tags), shuffle=True)
-
     # 训练
     for epoch in range(EPOCHS):
         index = 0
         for sentence, tags in zip(x_train, y_train):
             index += 1    # 计量每次迭代进行了多少步
             model.zero_grad()       # 清空梯度
-
             sentence = torch.tensor(sentence, dtype=torch.long)
             tags = torch.tensor([tag2id[t] for t in tags], dtype=torch.long)
-
-            loss = model.neg_log_likelihood(sentence, tags)
-
+            loss = model.neg_log_likelihood(sentence, tags)    # 模型定义的loss
             loss.backward()
             optimizer.step()
-
             if index % 50 == 0:
                 print("epoch", epoch, "batch", index)
 
@@ -91,11 +70,11 @@ def train():
                 zhun = float(len(jiaoji)) / len(entityres)  # 准确率
                 zhao = float(len(jiaoji)) / len(entityall)  # 召回率
                 print("test:")
-                print("zhun:", zhun)
-                print("zhao:", zhao)
-                print("f:", (2 * zhun * zhao) / (zhun + zhao))
+                print("precision:", zhun)
+                print("recall:", zhao)
+                print("F:", (2 * zhun * zhao) / (zhun + zhao))
             else:
-                print("zhun:", 0)
+                print("precision:", 0)
 
     path_name = "./model/model.pkl"
     print(path_name)
