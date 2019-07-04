@@ -156,10 +156,15 @@ class BiLSTM_CRF(nn.Module):
         gold_score = self._score_sentence(feats, tags)
         return forward_score - gold_score
 
+    def batch_loss(self, sentences, labels):
+        size = len(sentences)
+        total_loss = 0
+        for i in range(size):
+            total_loss += self.neg_log_likelihood(sentences[i], labels[i])
+        return total_loss/size
+
     def forward(self, sentence):  # dont confuse this with _forward_alg above.
         # Get the emission scores from the BiLSTM
         lstm_feats = self._get_lstm_features(sentence)  # len(sentence)*tag_size
-
-        # Find the best path, given the features.
         score, tag_seq = self._viterbi_decode(lstm_feats)
         return score, tag_seq

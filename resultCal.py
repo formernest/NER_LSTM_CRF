@@ -10,15 +10,19 @@ def calculate(x, y, id2word, id2tag, res=[]):
             continue
         if id2tag[y[j]][0] == 'B':
             entity = [id2word[x[j]] + '/' + id2tag[y[j]]]
-        elif id2tag[y[j]][0] == 'M' and len(entity) != 0 and entity[-1].split('/')[1][1:] == id2tag[y[j]][1:]:
+        elif id2tag[y[j]][0] == 'I' and len(entity) != 0 and entity[-1].split('/')[1][1:] == id2tag[y[j]][1:]:
             entity.append(id2word[x[j]] + '/' + id2tag[y[j]])
-        elif id2tag[y[j]][0] == 'E' and len(entity) != 0 and entity[-1].split('/')[1][1:] == id2tag[y[j]][1:]:
-            entity.append(id2word[x[j]] + '/' + id2tag[y[j]])
-            entity.append(str(j))
-            res.append(entity)
-            entity = []
         else:
-            entity = []
+            if len(entity) != 0:
+                res.append(entity)
+                entity = []
+    return res
+
+
+def calculate_batch(x, y, id2word, id2tag, res=[]):
+    size = len(x)
+    for i in range(size):
+        res.extend(calculate(x[i], y[i], id2word, id2tag, []))
     return res
 
 
