@@ -72,8 +72,8 @@ def data2pkl():
     y = np.asarray(list(df_data['y'].values))    #
 
     from sklearn.model_selection import train_test_split
-    x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.2, random_state=43)    # 划分训练集，测试集
-    x_train, x_valid, y_train, y_valid = train_test_split(x_train, y_train, test_size=0.2, random_state=43)  # 训练集，验证集
+    x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.1, random_state=43)    # 划分训练集，测试集
+    x_train, x_valid, y_train, y_valid = train_test_split(x_train, y_train, test_size=0.1, random_state=43)  # 训练集，验证集
 
     import pickle
     with open('./data/data.pkl', 'wb') as outp:  # 序列化

@@ -57,29 +57,29 @@ class BiLSTM_CRF(nn.Module):
         return (torch.randn(2, 1, self.hidden_dim // 2),
                 torch.randn(2, 1, self.hidden_dim // 2))
 
-    def _forward_alg(self, feats):
+    def _forward_alg(self, feats):  # [S, T]
         # Do the forward algorithm to compute the partition function
-        init_alphas = torch.full((1, self.tagset_size), -10000.)
+        init_alphas = torch.full((1, self.tagset_size), -10000.)  # [1,T]
         # START_TAG has all of the score.
         init_alphas[0][self.tag_to_ix[START_TAG]] = 0.
 
         # Wrap in a variable so that we will get automatic backprop
-        forward_var = init_alphas
+        forward_var = init_alphas   # [1,T]
 
         # Iterate through the sentence
-        for feat in feats:
-            alphas_t = []  # The forward tensors at this timestep
+        for feat in feats:   # feat [1,T]
+            alphas_t = []  # The forward tensors at this timestep   # [1, T]
             for next_tag in range(self.tagset_size):
                 # broadcast the emission score: it is the same regardless of
                 # the previous tag
                 emit_score = feat[next_tag].view(
-                    1, -1).expand(1, self.tagset_size)
+                    1, -1).expand(1, self.tagset_size)      # [1, T]
                 # the ith entry of trans_score is the score of transitioning to
                 # next_tag from i
-                trans_score = self.transitions[next_tag].view(1, -1)
+                trans_score = self.transitions[next_tag].view(1, -1)    # [1, T]
                 # The ith entry of next_tag_var is the value for the
                 # edge (i -> next_tag) before we do log-sum-exp
-                next_tag_var = forward_var + trans_score + emit_score
+                next_tag_var = forward_var + trans_score + emit_score    # [1, T]
                 # The forward variable for this tag is log-sum-exp of all the
                 # scores.
                 alphas_t.append(log_sum_exp(next_tag_var).view(1))
@@ -94,7 +94,7 @@ class BiLSTM_CRF(nn.Module):
         lstm_out, self.hidden = self.lstm(embeds, self.hidden)  # 初始化隐藏层,经过lstm输出和状态 len(sentence)*1*hidden_dim 1*1*hidden_size
         lstm_out = lstm_out.view(len(sentence), self.hidden_dim)  # lstm_out格式转化为len(sentence)*hidden_dim
         lstm_feats = self.hidden2tag(lstm_out)  # 线性转换hidden_dim to tag_size
-        return lstm_feats   # len(sentence)*tag_size
+        return lstm_feats   # len(sentence)*tag_size [S, T]
 
     def _score_sentence(self, feats, tags):
         # Gives the score of a provided tag sequence
@@ -151,14 +151,14 @@ class BiLSTM_CRF(nn.Module):
         return path_score, best_path
 
     def neg_log_likelihood(self, sentence, tags):
-        feats = self._get_lstm_features(sentence)   # len(sentence)*tag_size
+        feats = self._get_lstm_features(sentence)   # len(sentence)*tag_size [S,T]
         forward_score = self._forward_alg(feats)
         gold_score = self._score_sentence(feats, tags)
         return forward_score - gold_score
 
     def forward(self, sentence):  # dont confuse this with _forward_alg above.
         # Get the emission scores from the BiLSTM
-        lstm_feats = self._get_lstm_features(sentence)  # len(sentence)*tag_size
+        lstm_feats = self._get_lstm_features(sentence)  # len(sentence)*tag_size [S,T]
 
         # Find the best path, given the features.
         score, tag_seq = self._viterbi_decode(lstm_feats)
