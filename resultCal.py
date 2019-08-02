@@ -6,13 +6,18 @@ def calculate(x, y, id2word, id2tag, res=[]):
     x = x.numpy()
     entity = []
     for j in range(len(x)):
-        if x[j] == 0 or y[j] == 0:
-            continue
-        if id2tag[y[j]][0] == 'B':
-            entity = [id2word[x[j]] + '/' + id2tag[y[j]]]
-        elif id2tag[y[j]][0] == 'I' and len(entity) != 0 and entity[-1].split('/')[1][1:] == id2tag[y[j]][1:]:
-            entity.append(id2word[x[j]] + '/' + id2tag[y[j]])
-        else:
+        try:
+            if x[j] == 0 or y[j] == 0:
+                continue
+            if id2tag[y[j]][0] == 'B':
+                entity = [id2word[x[j]] + '/' + id2tag[y[j]]]
+            elif id2tag[y[j]][0] == 'I' and len(entity) != 0 and entity[-1].split('/')[1][1:] == id2tag[y[j]][1:]:
+                entity.append(id2word[x[j]] + '/' + id2tag[y[j]])
+            else:
+                if len(entity) != 0:
+                    res.append(entity)
+                    entity = []
+        except Exception as e:
             if len(entity) != 0:
                 res.append(entity)
                 entity = []
@@ -22,7 +27,7 @@ def calculate(x, y, id2word, id2tag, res=[]):
 def calculate_batch(x, y, id2word, id2tag, res=[]):
     size = len(x)
     for i in range(size):
-        res.extend(calculate(x[i], y[i], id2word, id2tag, []))
+        res = (calculate(x[i], y[i], id2word, id2tag, res))
     return res
 
 

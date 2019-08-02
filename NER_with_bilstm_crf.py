@@ -1,430 +1,413 @@
-# -*- coding:utf-8 -*-
-# create on 2018.09.27
-#
-import os
-import re
-import sys
-import jieba
-import traceback
-import time
-import math
-import numpy as np
+#!env python
+# -*- coding: UTF-8 -*-
+import codecs
 import pandas as pd
-import source.util as util
-import source.log as log
+import numpy as np
+import collections
+from sklearn.model_selection import train_test_split
+import pickle
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn import CrossEntropyLoss
-from torch.optim import Adam
 from torch.utils.data import TensorDataset, DataLoader
-from gensim.corpora import Dictionary
-from pypinyin import lazy_pinyin
-from sklearn.feature_extraction.text import TfidfTransformer
-from sklearn.feature_extraction.text import CountVectorizer
-from Levenshtein import distance
-from random import shuffle, choice
-from source.api import ModelTrain
-from source.api import dic2str
+import datetime
+import torch.optim as optim
+
+#############
+START_TAG = "<START>"
+STOP_TAG = "<STOP>"
+EMBEDDING_DIM = 100  # 嵌入层维度
+HIDDEN_DIM = 200  # 隐藏层数量
+EPOCHS = 5  # 迭代几次
+BATCH_SIZE = 64  # 每个batch的大小
+SEQ_LEN = 60
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-class Cnn(nn.Module):
-    def __init__(self, embed_mat, class_num):
-        super(Cnn, self).__init__()
-        self.vocab_num, self.embed_len = embed_mat.size()
-        self.win_len = 7
-        self.class_num = class_num
-        self.embed = nn.Embedding(vocab_num, embed_len, _weight=embed_mat)
-        self.conv = nn.Conv1d(embed_len, 128, kernel_size=self.win_len, padding=0)
-        self.gate = nn.Conv1d(embed_len, 128, kernel_size=self.win_len, padding=0)
-        self.la = nn.Sequential(nn.Linear(128, 200),
-                                nn.ReLU())
-        self.dl = nn.Sequential(nn.Dropout(0.2),
-                                nn.Linear(200, class_num))
+class BiLSTM_CRF(nn.Module):
 
-    def forward(self, x):
-        x = self.embed(x)
-        x = x.permute(0, 2, 1)
-        g = torch.sigmoid(self.gate(x))
-        x = self.conv(x)
-        x = x * g
-        x = x.permute(0, 2, 1)
-        x = self.la(x)
-        return self.dl(x)
+    def __init__(self, vocab_size, tag_to_ix, embedding_dim, hidden_dim):
+        torch.manual_seed(1)
+        super(BiLSTM_CRF, self).__init__()
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.vocab_size = vocab_size
+        self.tag_to_ix = tag_to_ix
+        self.tagset_size = len(tag_to_ix)
+        self.word_embeds = nn.Embedding(vocab_size, embedding_dim)
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim // 2,
+                            num_layers=1, bidirectional=True)
+
+        # Maps the output of the LSTM into tag space.
+        self.hidden2tag = nn.Linear(hidden_dim, self.tagset_size)
+
+        # Matrix of transition parameters.  Entry i,j is the score of
+        # transitioning *to* i *from* j.
+        self.transitions = nn.Parameter(
+            torch.randn(self.tagset_size, self.tagset_size))
+
+        # These two statements enforce the constraint that we never transfer
+        # to the start tag and we never transfer from the stop tag
+        self.transitions.data[tag_to_ix[START_TAG], :] = -10000
+        self.transitions.data[:, tag_to_ix[STOP_TAG]] = -10000
+
+        self.hidden = self.init_hidden()
+
+    @staticmethod
+    def argmax(vec):
+        # return the argmax as a python int
+        _, idx = torch.max(vec, 1)
+        return idx.item()
+
+    @staticmethod
+    def prepare_sequence(seq, to_ix):
+        idxs = [to_ix[w] for w in seq]
+        return torch.tensor(idxs, dtype=torch.long)
+
+    # Compute log sum exp in a numerically stable way for the forward algorithm
+    def log_sum_exp(self, vec):
+        max_score = vec[0, self.argmax(vec)]
+        max_score_broadcast = max_score.view(1, -1).expand(1, vec.size()[1])
+        return max_score + \
+               torch.log(torch.sum(torch.exp(vec - max_score_broadcast)))
+
+    def init_hidden(self):
+        return (torch.randn(2, 1, self.hidden_dim // 2),
+                torch.randn(2, 1, self.hidden_dim // 2))
+
+    def _forward_alg(self, feats):
+        # Do the forward algorithm to compute the partition function
+        init_alphas = torch.full((1, self.tagset_size), -10000.)
+        # START_TAG has all of the score.
+        init_alphas[0][self.tag_to_ix[START_TAG]] = 0.
+
+        # Wrap in a variable so that we will get automatic backprop
+        forward_var = init_alphas
+
+        # Iterate through the sentence
+        for feat in feats:
+            alphas_t = []  # The forward tensors at this timestep
+            for next_tag in range(self.tagset_size):
+                # broadcast the emission score: it is the same regardless of
+                # the previous tag
+                emit_score = feat[next_tag].view(
+                    1, -1).expand(1, self.tagset_size)
+                # the ith entry of trans_score is the score of transitioning to
+                # next_tag from i
+                trans_score = self.transitions[next_tag].view(1, -1)
+                # The ith entry of next_tag_var is the value for the
+                # edge (i -> next_tag) before we do log-sum-exp
+                next_tag_var = forward_var + trans_score + emit_score
+                # The forward variable for this tag is log-sum-exp of all the
+                # scores.
+                alphas_t.append(self.log_sum_exp(next_tag_var).view(1))
+            forward_var = torch.cat(alphas_t).view(1, -1)
+        terminal_var = forward_var + self.transitions[self.tag_to_ix[STOP_TAG]]
+        alpha = self.log_sum_exp(terminal_var)
+        return alpha
+
+    def _get_lstm_features(self, sentence):
+        self.hidden = self.init_hidden()
+        embeds = self.word_embeds(sentence).view(len(sentence), 1, -1)  # batch_size*len(sentence)*embed_dim to len(sentence)*1*embedding_dim 1应该是batch_size
+        lstm_out, self.hidden = self.lstm(embeds, self.hidden)  # 初始化隐藏层,经过lstm输出和状态 len(sentence)*1*hidden_dim 1*1*hidden_size
+        lstm_out = lstm_out.view(len(sentence), self.hidden_dim)  # lstm_out格式转化为len(sentence)*hidden_dim
+        lstm_feats = self.hidden2tag(lstm_out)  # 线性转换hidden_dim to tag_size
+        return lstm_feats   # len(sentence)*tag_size
+
+    def _score_sentence(self, feats, tags):
+        # Gives the score of a provided tag sequence
+        score = torch.zeros(1)
+        tags = torch.cat([torch.tensor([self.tag_to_ix[START_TAG]], dtype=torch.long), tags])
+        for i, feat in enumerate(feats):
+            score = score + \
+                self.transitions[tags[i + 1], tags[i]] + feat[tags[i + 1]]
+        score = score + self.transitions[self.tag_to_ix[STOP_TAG], tags[-1]]
+        return score
+
+    def _viterbi_decode(self, feats):  # len(sentence)*tag_size
+        backpointers = []
+
+        # Initialize the viterbi variables in log space
+        init_vvars = torch.full((1, self.tagset_size), -10000.)   # 1*tagsize [-10000.,......]
+        init_vvars[0][self.tag_to_ix[START_TAG]] = 0  # [-10000.,....,0,-10000.]
+
+        # forward_var at step i holds the viterbi variables for step i-1
+        forward_var = init_vvars
+        for feat in feats:  # len(sentence)*tag_size
+            bptrs_t = []  # holds the backpointers for this step
+            viterbivars_t = []  # holds the viterbi variables for this step
+
+            for next_tag in range(self.tagset_size):
+                # next_tag_var[i] holds the viterbi variable for tag i at the
+                # previous step, plus the score of transitioning
+                # from tag i to next_tag.
+                # We don't include the emission scores here because the max
+                # does not depend on them (we add them in below)
+                next_tag_var = forward_var + self.transitions[next_tag]
+                best_tag_id = self.argmax(next_tag_var)
+                bptrs_t.append(best_tag_id)
+                viterbivars_t.append(next_tag_var[0][best_tag_id].view(1))
+            # Now add in the emission scores, and assign forward_var to the set
+            # of viterbi variables we just computed
+            forward_var = (torch.cat(viterbivars_t) + feat).view(1, -1)
+            backpointers.append(bptrs_t)
+
+        # Transition to STOP_TAG
+        terminal_var = forward_var + self.transitions[self.tag_to_ix[STOP_TAG]]
+        best_tag_id = self.argmax(terminal_var)
+        path_score = terminal_var[0][best_tag_id]
+
+        # Follow the back pointers to decode the best path.
+        best_path = [best_tag_id]
+        for bptrs_t in reversed(backpointers):
+            best_tag_id = bptrs_t[best_tag_id]
+            best_path.append(best_tag_id)
+        # Pop off the start tag (we dont want to return that to the caller)
+        start = best_path.pop()
+        assert start == self.tag_to_ix[START_TAG]  # Sanity check
+        best_path.reverse()
+        return path_score, best_path
+
+    def neg_log_likelihood(self, sentence, tags):
+        feats = self._get_lstm_features(sentence)   # len(sentence)*tag_size
+        forward_score = self._forward_alg(feats)
+        gold_score = self._score_sentence(feats, tags)
+        return forward_score - gold_score
+
+    def batch_loss(self, sentences, labels):
+        result = torch.zeros(len(sentences))
+        for i in range(len(sentences)):
+            result[i] = self.neg_log_likelihood(sentences[i], labels[i])
+        return torch.mean(result)
+
+    def forward(self, sentence):  # dont confuse this with _forward_alg above.
+        # Get the emission scores from the BiLSTM
+        lstm_feats = self._get_lstm_features(sentence)  # len(sentence)*tag_size
+        score, tag_seq = self._viterbi_decode(lstm_feats)
+        return score, tag_seq
 
 
-class Rnn(nn.Module):
-    def __init__(self, embed_mat, class_num):  # embed_mat：字tensor，seq_len：每句50个字，class_num：5个分类
-        super(Rnn, self).__init__()
-        self.vocab_num, self.embed_len = embed_mat.size()  # 字数，每个字的维度：每个字200维
-        self.class_num = class_num
-        self.embed = nn.Embedding(self.vocab_num, self.embed_len, _weight=embed_mat)  # 嵌入层
-        self.ra = nn.LSTM(self.embed_len, 200, batch_first=True, bidirectional=True)  # 输入特征维度为字向量的维度,隐状态特征维度200，1个lstm层，batch_first=True表示顺序[batch_size, time_step, input_size]，双向
-        self.dl = nn.Sequential(nn.Dropout(0.2),
-                                nn.Linear(400, self.class_num))  # Sequential时序容器，Linear：线性变换y=Ax+b，全连接层
+class CommModelTrain():
 
-    def forward(self, x):  # 每次执行的 计算步骤 二维，32行，每行50个字
-        x = self.embed(x)  # 转向量的张量 三维，32行，每行50个字，每个字200维
-        h, hc_n = self.ra(x)  # 输入：input（batch_size, time_step, input_size），(h_0, c_0)  输出：output , (h_n隐藏层状态, c_n记忆层状态)
-        return self.dl(h)
+    def __init__(self):
+        self.word2id = dict()
+        self.id2word = dict()
+        self.tag2id = dict()
+        self.id2tag = dict()
+        data_path = './data/train'
+        self.data2pkl(data_path)
+        self.tag2id[START_TAG] = len(self.tag2id)
+        self.tag2id[STOP_TAG] = len(self.tag2id)
+        self.test_size = 0.1
+        pass
 
-
-class CommModelTrain(ModelTrain):
-    def __init__(self, nntype, datapath, threshold, modelparmvalue, trainloger):
-        self.type = nntype       # model类型
-        self.datapath = datapath  # 数据路径
-        self.threshold = '0.85|32|10'.split('|')  # 阈值
-        self.modelparmvalue = modelparmvalue  # 模型参数
-        self.trainloger = trainloger  # 训练日志
-        self.intent_sentences = {}  # 意图
-        self.featureWordsWeight = None  # 特征权重
-        self.include_intents_list = list()
-        self.levenshtein_threshold = 0.40  # 编辑距离阈值
-        self.jaccard_threshold = 0.45
-        self.embed_len = 200  # 字维度？
-        self.max_vocab = 5000  # 最高词频
-        self.min_freq = 1  # 最低词频
-        self.seq_len = 50  # 每句50字
-        self.lr = 1e-3  # 学习率
-        self.validation_split = 0.2  # 验证集
-        self.ind_label = dict()
-        self.word_inds = None  # word-id
-        self.embed_mat = None   # 字向量
-        self.load_model = None  # 使用的模型
-        self.label_inds = None
-        if threshold != None and len(threshold) > 0:
-            self.threshold = threshold.split('|')
-        self.stopwords_re, self.homonymwords, self.synonymwords = util.load_model_depend_file(self.datapath)
-        if self.type == '5.0.1' or self.type == '5.0.2':
-            if len(self.threshold) != 3:
-                self.__err('invalid threshold:', self.threshold)
-        if self.modelparmvalue is not None and type(self.modelparmvalue) == type({}):
-            if self.modelparmvalue.get('class_lr', None) is not None:
-                self.lr = float(self.modelparmvalue['class_lr'])
-            if self.modelparmvalue.get('class_validation_split', None) is not None:
-                self.validation_split = float(self.modelparmvalue['class_validation_split'])
-            if self.modelparmvalue.get('class_embed_len', None) is not None:
-                self.embed_len = int(self.modelparmvalue['class_embed_len'])
-            if self.modelparmvalue.get('class_max_vocab', None) is not None:
-                self.max_vocab = int(self.modelparmvalue['class_max_vocab'])
-            if self.modelparmvalue.get('class_seq_len', None) is not None:
-                self.seq_len = int(self.modelparmvalue['class_seq_len'])
-
-    def __log(self, *args):
-        info = 'entityRecognize_pytorch '
-        for a in args:
-            info += str(a)
-        log.log(info)
-        if self.trainloger is not None:
-            self.trainloger.info(info)
-
-    def __err(self, *args):
-        info = 'entityRecognize_pytorch '
-        for a in args:
-            info += str(a)
-        log.err(info)
-        if self.trainloger is not None:
-            self.trainloger.info(info)
-
-    def fit(self):
-        try:
-            word_vecs = util.load_model_word_vec(self.datapath)
-            line_list, label_list = self._generate(self._loadsyntax(), self._loadslots(), 5000)
-            self.__log('########line_list', line_list)
-            self.__log('########label_list', label_list)
-
-            self.__id2vecs(word_vecs, line_list)
-            self.__label2ind(label_list)
-            pad_seqs, inds = self.__align(line_list, label_list, False)    # line index padding, label index padding
-            self.__compile_fit(int(self.threshold[1]), int(self.threshold[2]), pad_seqs, inds)
-            return True, set(), set(), [], ''
-        except Exception as e:
-            self.__err(str(Exception), ':', repr(e), '\n', traceback.format_exc())
-            return False, None
-
-    def load(self):
-        self.device = torch.device('cpu')
-        if self.type == '5.0.1':
-            if self.load_model is None:
-                self.load_model = torch.load(self.datapath + '/cnnclass.pkl')
-        elif self.type == '5.0.2':
-            if self.load_model is None:
-                self.load_model = torch.load(self.datapath + '/rnnclass.pkl')
-
-    def predict(self, content):
-        try:
-            text = content.strip()
-            pad_seq = self.__sent2ind(list(text), keep_oov=True)
-            sent = torch.LongTensor([pad_seq]).to(self.device)
-
-            with torch.no_grad(): #在上下文环境中切断梯度计算
-                self.load_model.eval()  # 切换到测试模式
-                probs = F.softmax(self.load_model(sent), dim=-1)  # softmax转概率分布输出
-            probs = probs.numpy()[0]
-            inds = np.argmax(probs, axis=1)
-            preds = [self.ind_label[ind] for ind in inds[-len(text):]]
-            pairs = list()
-            for word, pred in zip(text, preds):
-                pairs.append((word, pred))
-
-            label = ''
-            entity = ''
-            entity_list = []
-            intent_slots = []
-            for id in range(len(pairs)):
-                if self.label_inds.get(pairs[id][1], None):
-                    label = re.findall('.-(.*)',pairs[id][1])
-                    if re.findall('B-(.*)', pairs[id][1]):
-                        if len(entity) > 0:
-                            entity_list.append(entity + ':' + intent_slots[-1])
-                        entity = pairs[id][0]
-                        intent_slots.append(label[0])
-                    elif re.findall('I-(.*)', pairs[id][1]):
-                        entity += pairs[id][0]
-            if len(entity) > 0:
-                entity_list.append(entity + ':' + intent_slots[-1])
-
-            predict = {}
-            predict['content'] = content
-            if len(intent_slots) == 0:
-                predict['thresholdintent'] = '其他'
-                predict['maxprob'] = 0.0
+    def flatten(self, x):
+        result = []
+        for el in x:
+            if isinstance(x, collections.Iterable) and not isinstance(el, str):
+                result.extend(self.flatten(el))
             else:
-                predict['thresholdintent'] = '|'.join(intent_slots)
-                predict['entity'] = '|'.join(entity_list)
-                predict['pairs'] = str(pairs)
-                predict['maxprob'] = 1.0
+                result.append(el)
+        return result
 
-            return predict
-        except Exception as e:
-            self.__err(str(Exception),':', repr(e), '\n', traceback.format_exc())
-            return None
+    def X_padding(self, words):
+        ids = list(self.word2id[words])
+        if len(ids) >= SEQ_LEN:
+            return ids[:SEQ_LEN]
+        ids.extend([0] * (SEQ_LEN - len(ids)))
+        return ids
 
-    def _loadsyntax(self):
-        temps = list()
-        pathfile = os.path.join(self.datapath + '/syntax/template.txt')
-        if os.path.exists(pathfile) == True:
-            with open(pathfile) as f:
-                for line in f:
-                    if len(line) == 0:
-                        continue
-                    parts = line.strip().split()
-                    temps.append(parts)
-        self.__log('#########temps',temps)
-        return temps
+    def y_padding(self, tags):
+        ids = list(self.tag2id[tags])
+        if len(ids) >= SEQ_LEN:
+            return ids[:SEQ_LEN]
+        ids.extend([0] * (SEQ_LEN - len(ids)))
+        return ids
 
-    def _loadslots(self):
-        entity_dic = {}
-        files = os.listdir(os.path.join(self.datapath, 'slot'))
-        for file in files:
-            slot = os.path.splitext(file)[0]
-            entity_dic[slot] = self._loadslot(self.datapath+'/slot/' + file)
-        self.__log('###########entity_dic:',entity_dic)
-        return entity_dic
-
-    def _loadslot(self, pathfile):
-        slot_entity_list = []
-        entity_strs = pd.read_csv(pathfile).values
-        for entity_str in entity_strs:
-            entity_str0 = '' if pd.isnull(entity_str[0]) else entity_str[0]
-            entity_str1 = '' if pd.isnull(entity_str[1]) else entity_str[1]
-            if len(entity_str1) > 0:
-                slot_entity_list.append([entity_str0,entity_str1.strip().split()])
-            else:
-                slot_entity_list.append([entity_str0, None])
-        return slot_entity_list
-
-    def _generate(self, temps, slots, num):
-        word_mat = []
-        label_mat = []
-        for i in range(num):
-            parts = choice(temps)
-            words, labels = list(), list()
-            for part in parts:
-                if slots.get(part, None):
-                    entity = choice(slots[part])
-                    words.extend(entity[0])
-                    labels.append('B-' + part)
-                    if len(entity[0]) > 1:
-                        labels.extend(['I-' + part] * (len(entity[0]) - 1))
+    def calculate(self, x, y, res=[]):
+        x = x.numpy()
+        entity = []
+        for j in range(len(x)):
+            try:
+                if x[j] == 0 or y[j] == 0:
+                    continue
+                if self.id2tag[y[j]][0] == 'B':
+                    entity = [self.id2word[x[j]] + '/' + self.id2tag[y[j]]]
+                elif self.id2tag[y[j]][0] == 'I' and len(entity) != 0 and entity[-1].split('/')[1][1:] == self.id2tag[y[j]][1:]:
+                    entity.append(self.id2word[x[j]] + '/' + self.id2tag[y[j]])
                 else:
-                    words.extend(part)
-                    labels.extend(['O'] * len(part))
-            word_mat.append(words)
-            label_mat.append(labels)
-        return word_mat, label_mat
+                    if len(entity) != 0:
+                        res.append(entity)
+                        entity = []
+            except Exception as e:
+                if len(entity) != 0:
+                    res.append(entity)
+                    entity = []
+        return res
 
-    def _loadtrain(self, path, intentname, regretest, intent_sentences, line_list, label_list):
-        files = os.listdir(path)
-        for file in files:
-            pathfile = os.path.join(path, file)
-            if os.path.isfile(pathfile):
-                if not file.endswith('.csv'):
-                    continue
-                intent = os.path.splitext(file)[0]
-                if len(intentname) > 0:
-                    intent = (intentname + '/' + intent).split('/')[0]
-                if len(self.include_intents_list) > 0 and intent not in self.include_intents_list:
-                    intent = '其他'
-                with open(pathfile) as f:
-                    for line in f:
-                        regretest.append(intent + ',' + line.strip())
-                        line = util.sentence_repair(line, self.stopwords_re, self.homonymwords, self.synonymwords)
-                        if len(line.strip()) == 0:
-                            continue
-                        if intent_sentences.get(intent, None) is None:
-                            intent_sentences[intent] = list()
-                        intent_sentences[intent].append((line, len(line), ''.join(lazy_pinyin(line)), len(''.join(lazy_pinyin(line)))))
-                        if line not in line_list:
-                            line_list.append(line)
-                            label_list.append(intent)
-            elif os.path.isdir(pathfile):
-                if file == '__pycache__':
-                    continue
-                intent = file
-                if len(intentname) > 0:
-                    intent = (intentname + '/' + intent).split('/')[0]
-                self._loadtrain(pathfile, intent, regretest, intent_sentences, line_list, label_list)
+    def calculate_batch(self, x, y, id2word, id2tag, res=[]):
+        size = len(x)
+        for i in range(size):
+            res = (self.calculate(x[i], y[i], id2word, id2tag, res))
+        return res
 
-    def __id2vecs(self, word_vecs, sent_words):
-        model = Dictionary(sent_words)
-        model.filter_extremes(no_below=self.min_freq, no_above=1.0, keep_n=self.max_vocab)  # 去掉高频、低频词
-        self.word_inds = model.token2id  # 存放的是单词-id key-value对
-        self.word_inds = {word: ind + 2 for word, ind in self.word_inds.items()}  # 对每一个value执行value+2
-        self.embed_mat = np.zeros((min(self.max_vocab + 2, len(self.word_inds) + 2), self.embed_len))   # 初始化矩阵embed_mat
-        for word, ind in self.word_inds.items():
-            if word in word_vecs.vocab:
-                if ind < self.max_vocab:
-                    self.embed_mat[ind] = word_vecs[word]    # ？
-        self.__log('###id2vecs ', len(self.embed_mat), 'x', len(self.embed_mat[0]), '\n', self.embed_mat)
+    def data2pkl(self, path):
+        datas = list()
+        labels = list()
+        tags = set()
+        # input_data = codecs.open('./data/train', 'r', 'utf-8')
+        input_data = codecs.open(path, 'r', 'utf-8')
+        for line in input_data.readlines():
+            line = line.strip().split('\t')
+            linedata = list(line[0].split())
+            linelabel = list(line[1].split())
+            set1 = set(linelabel)
+            tags = tags.union(set1)
+            datas.append(linedata)
+            labels.append(linelabel)
 
-    def __label2ind(self, labels):
-        labels_list = []
-        for i in range(len(labels)):
-            labels_list.extend(labels[i])
-        self.label_inds = {}
-        self.label_inds['N'] = 0
-        labels = sorted(list(set(labels_list)))
-        for i in range(len(labels)):
-            self.ind_label[i + 1] = labels[i]
-            self.label_inds[labels[i]] = i + 1
+        input_data.close()
+        all_words = self.flatten(datas)   # 将二维的datas放入一维的all_words
+        sr_allwords = pd.Series(all_words)    # 一维的标签矩阵，类似于字典   index:words
+        sr_allwords = sr_allwords.value_counts()    # 统计字的词频，使词频高的在前 word:count
+        set_words = sr_allwords.index     # 真正的words set
+        set_ids = range(1, len(set_words) + 1)   # id范围
 
-    def __pad(self, seq):
-        if len(seq) < self.seq_len:
-            return [0] * (self.seq_len - len(seq)) + seq
-        else:
-            return seq[-self.seq_len:]
+        tags = [i for i in tags]
+        tag_ids = range(len(tags))
+        self.word2id = pd.Series(set_ids, index=set_words)  # word:id   id从1开始
+        self.id2word = pd.Series(set_words, index=set_ids)  # id:word
+        self.tag2id = pd.Series(tag_ids, index=tags)        # tag:id id从0开始
+        self.id2tag = pd.Series(tags, index=tag_ids)        # id:tag
+        self.word2id["unknow"] = len(self.word2id) + 1
 
-    def __sent2ind(self, words, keep_oov):
-        seq = list()
-        for word in words:
-            if word in self.word_inds:
-                seq.append(self.word_inds[word])
-            elif keep_oov:
-                seq.append(1)
-        return self.__pad(seq)
+        df_data = pd.DataFrame({'words': datas, 'tags': labels}, index=range(len(datas)))  # index:datas:labels
+        df_data['x'] = df_data['words'].apply(self.X_padding)    # 对每一行的word进行word-id转换并填充,df_data['x']形式为index:x,object
+        df_data['y'] = df_data['tags'].apply(self.y_padding)     # 对每一行的label进行tag_id转换并填充
+        # df_data['x'] = self.X_padding(df_data['words'], self.word2id, SEQ_LEN)    # 对每一行的word进行word-id转换并填充,df_data['x']形式为index:x,object
+        # df_data['y'] = self.y_padding(df_data['tags'], self.tag2id, SEQ_LEN)   # 对每一行的label进行tag_id转换并填充
+        x = np.asarray(list(df_data['x'].values))    # 去掉index将df_data['x']转换为二维的list类型，line_count*max_len
+        y = np.asarray(list(df_data['y'].values))    #
+        # split train and test
+        x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.1, random_state=43)    # 划分训练集，测试集
+        x_train, x_valid, y_train, y_valid = train_test_split(x_train, y_train, test_size=0.1, random_state=43)  # 训练集，验证集
 
-    def __add_buf(self, seqs):
-        buf = [0] * int((win_len - 1) / 2)
-        buf_seqs = list()
-        for seq in seqs:
-            buf_seqs.append(buf + seq + buf)
-        return buf_seqs
+        # 序列化
+        with open('./data/data.pkl', 'wb') as outp:
+            pickle.dump(self.word2id, outp)
+            pickle.dump(self.id2word, outp)
+            pickle.dump(self.tag2id, outp)
+            pickle.dump(self.id2tag, outp)
+            pickle.dump(x_train, outp)
+            pickle.dump(y_train, outp)
+            pickle.dump(x_test, outp)
+            pickle.dump(y_test, outp)
+            pickle.dump(x_valid, outp)
+            pickle.dump(y_valid, outp)
+        #
+        print('** Finished saving the data.')
+        # return x_train, y_train, x_test, y_test
 
-    def __align(self, sent_words, labels, extra):
-        pad_seqs = list()
-        for words in sent_words:
-            pad_seq = self.__sent2ind(words, keep_oov=True)
-            pad_seqs.append(pad_seq)
-        if extra:
-            pad_seqs = self.__add_buf(pad_seqs)
-        pad_seqs = np.array(pad_seqs)
+    def load_data(self):
+        # 加载数据
+        with open('./data/data.pkl', 'rb') as inp:
+            word2id = pickle.load(inp)
+            id2word = pickle.load(inp)
+            tag2id = pickle.load(inp)
+            id2tag = pickle.load(inp)
+            x_train = pickle.load(inp)
+            y_train = pickle.load(inp)
+            x_test = pickle.load(inp)
+            y_test = pickle.load(inp)
+            # x_valid = pickle.load(inp)
+            # y_valid = pickle.load(inp)
+        # print("train len:", len(x_train))
+        # print("test len:", len(x_test))
+        # print("valid len", len(x_valid))
 
-        inds = list()
-        for label in labels:
-            ls = []
-            for item in label:
-                ls.append(self.label_inds[item])
-            inds.append(self.__pad(ls))
-        inds = np.array(inds)
-        self.__log('###align ', len(pad_seqs), 'x', len(pad_seqs[0]), ' ',len(inds), '\n', pad_seqs, '\n', inds)
-        return pad_seqs, inds
+        # 将START_TAG和STOP_TAG加入tag字典中
+        # tag2id[START_TAG] = len(tag2id)
+        # tag2id[STOP_TAG] = len(tag2id)
+        x_train = x_train[:10000]
+        y_train = y_train[:10000]
 
-    def __get_metric(self, model, loss_func, pairs):
-        sents, labels = pairs
-        labels = labels.view(-1)
-        num = (labels > 0).sum().item()
-        prods = model(sents)  # 返回是一个Variable，里面包含grad_fn才能实现反向梯度传递[[-0.0785, -0.9034, -0.3025,  2.0512, -1.0713], [-0.0614, -0.8819,  0.3913,  1.0619, -0.7799],
-        prods = prods.view(-1, prods.size(-1))
-        preds = torch.max(prods, 1)[1]  # 取最大的预测
-        loss = loss_func(prods, labels)  # tensor(1.3219, grad_fn=<NllLossBackward>)
-        acc = (preds == labels).sum().item()  # 预测与结果有多少是一致的
-        return loss, acc, num
+        x_test = x_test[:1000]
+        y_test = y_test[:1000]
+        return x_train, y_train, x_test, y_test
 
-    def __batch_train(self, model, loss_func, loader, optim):  # 训练数据
-        total_loss, total_acc, total_num = [0] * 3
-        for step, pairs in enumerate(loader):
-            batch_loss, batch_acc, batch_num = self.__get_metric(model, loss_func, pairs)
-            optim.zero_grad()
-            batch_loss.backward()
-            optim.step()
-            total_loss = total_loss + batch_loss.item()
-            total_acc, total_num = total_acc + batch_acc, total_num + batch_num
-            self.__log('{} {} - loss: {:.3f} - acc: {:.3f}'.format('step', step + 1, batch_loss/batch_num, batch_acc/batch_num))
-        return total_loss / total_num, total_acc / total_num
+    # train
+    def fit(self):
+        # path = './data/train'
+        # word2id, id2word, tag2id, id2tag, x_train, y_train, x_test, y_test = self.data2pkl(path)
+        x_train, y_train, x_test, y_test = self.load_data()
+        model = BiLSTM_CRF(len(self.word2id) + 1, self.tag2id, EMBEDDING_DIM, HIDDEN_DIM).to(DEVICE)  # 实例化模型
+        optimizer = optim.SGD(model.parameters(), lr=0.005, weight_decay=1e-4)  # 随机梯度下降优化算法
+        # train_data
+        sentence = torch.tensor(x_train, dtype=torch.long).to(DEVICE)
+        y_train1 = [[self.tag2id[y_train[i][j]] for j in range(len(y_train[i]))] for i in range(len(y_train))]
+        tags = torch.tensor(y_train1, dtype=torch.long).to(DEVICE)
+        trainloader = DataLoader(TensorDataset(sentence, tags), batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+        # test_data
+        sentence = torch.tensor(x_test, dtype=torch.long).to(DEVICE)
+        y_test1 = [[self.tag2id[y_test[i][j]] for j in range(len(y_test[i]))] for i in range(len(y_test))]
+        tags = torch.tensor(y_test1, dtype=torch.long).to(DEVICE)
+        testloader = DataLoader(TensorDataset(sentence, tags), batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+        print("train start:", datetime.datetime.now())
 
-    def __batch_dev(self, model, loss_func, loader):
-        total_loss, total_acc, total_num = [0] * 3
-        for step, pairs in enumerate(loader):
-            batch_loss, batch_acc, batch_num = self.__get_metric(model, loss_func, pairs)
-            total_loss = total_loss + batch_loss.item()
-            total_acc, total_num = total_acc + batch_acc, total_num + batch_num
-        return total_loss / total_num, total_acc / total_num
+        # 训练
+        for epoch in range(EPOCHS):
+            for batch, data in enumerate(trainloader, 0):
+                sentences, labels = data
+                model.zero_grad()  # 清空梯度
+                loss = model.batch_loss(sentences, labels)
+                loss.backward()
+                optimizer.step()
+                if batch % 20 == 0 and batch > 0:
+                    print("epoch:", epoch, "batch:", batch, 'current time:', datetime.datetime.now())
 
-    def __compile_fit(self, batch_size, epochs, lines, labels):
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')   # 设置GPU
-        bound = int(len(lines)*(1-self.validation_split))
-        train_sents = torch.LongTensor(lines[:bound]).to(device)
-        train_labels = torch.LongTensor(labels[:bound]).to(device)
-        dev_sents = torch.LongTensor(lines[bound:]).to(device)
-        dev_labels = torch.LongTensor(labels[bound:]).to(device)
+            entityres = []
+            entityall = []
+            # 每个epoch后测试一下
+            print('test start:', datetime.datetime.now())
+            for batch, data in enumerate(testloader, 0):
+                sentences, labels = data
+                for sentence, label in zip(sentences, labels):
+                    score, predict = model(sentence)
+                    entityres = self.calculate(sentence, predict, self.id2word, self.id2tag, entityres)
+                    entityall = self.calculate(sentence, label, self.id2word, self.id2tag, entityall)
 
-        train_loader = DataLoader(TensorDataset(train_sents, train_labels), batch_size=batch_size, shuffle=True)
-        dev_loader = DataLoader(TensorDataset(dev_sents, dev_labels), batch_size=batch_size, shuffle=True)
-        embed_mat_tensor = torch.Tensor(self.embed_mat)  # torch.FlaotTensor 字向量转为tensor
+            jiaoji = [i for i in entityres if i in entityall]
+            if len(jiaoji) != 0:
+                zhun = float(len(jiaoji)) / len(entityres)  # 准确率
+                zhao = float(len(jiaoji)) / len(entityall)  # 召回率
+                print("test:")
+                print("precision:", zhun)
+                print("recall:", zhao)
+                print("F:", (2 * zhun * zhao) / (zhun + zhao))
+            else:
+                print("precision:", 0)
+            print('test end:', datetime.datetime.now())
+            path_name = "./model/model" + str(epoch) + ".pkl"
+            print(path_name)
+            torch.save(model, path_name)
+            print("model has been saved")
 
-        class_num = len(self.label_inds)
-        model = None
-        filepath = ''
-        if self.type == '5.0.1':
-            model = Cnn(embed_mat_tensor, class_num).to(device)
-            filepath = self.datapath + '/cnnclass.pkl'
-        elif self.type == '5.0.2':
-            model = Rnn(embed_mat_tensor, class_num).to(device)
-            filepath = self.datapath + '/rnnclass.pkl'
-        loss_func = CrossEntropyLoss(ignore_index=0, reduction='sum')  # 交叉熵损失函数LogSoftMax和NLLLoss的集成，一般用于分类
+        print('train finished:', datetime.datetime.now())
 
-        self.__log('###compile_fit adam(lr=', self.lr, ') batch_size=', int(batch_size),' epochs=', int(epochs),
-                   ' validation_split=', self.validation_split, '\n{}'.format(model))
-
-        min_dev_loss = float('inf')  # 正无穷
-        for i in range(epochs):
-            model.train()
-            optimizer = Adam(model.parameters(), lr=self.lr)  # optim.Adam 随机优化方法
-            start = time.time()
-            train_loss, train_acc = self.__batch_train(model, loss_func, train_loader, optimizer)
-            delta = time.time() - start
-            with torch.no_grad():  # 在上下文环境中切断梯度计算
-                model.eval()  # 切换到测试模式
-                dev_loss, dev_acc = self.__batch_dev(model, loss_func, dev_loader)
-            extra = ''
-            if dev_loss < min_dev_loss:
-                extra = ', val_loss reduce {:.3f}'.format(min_dev_loss - dev_loss)
-                torch.save(model, filepath)
-                min_dev_loss = dev_loss
-            self.__log('{} {} - {:.2f}s - loss: {:.3f} - acc: {:.3f} - val_loss: {:.3f} - val_acc: {:.3f}'.format(
-                'epoch', i, delta, train_loss, train_acc, dev_loss, dev_acc) + extra)
+    # predict
+    def predict(self, sentence, path):
+        # word2id, id2word, tag2id, id2tag = self.load_date()
+        path = './model/model.pkl'
+        model = torch.load(path)
+        sentence = self.X_padding(sentence)
+        score, predict = model(sentence)
+        res = self.calculate(sentence, predict, self.id2word, self.id2tag)
+        print(res)
 
 
-def applyModelTrain(type, datapath, threshold, modelparmvalue, trainloger):
-    return CommModelTrain(type, datapath, threshold, modelparmvalue, trainloger)
+def applyModelTrain():
+    train_model = CommModelTrain()
+    train_model.fit()
+
+if __name__ == '__main__':
+    applyModelTrain()
+

@@ -1,11 +1,11 @@
 import torch
-import torch.autograd as autograd
 import torch.nn as nn
-import torch.optim as optim
 
 torch.manual_seed(1)
 START_TAG = "<START>"
 STOP_TAG = "<STOP>"
+
+
 def argmax(vec):
     # return the argmax as a python int
     _, idx = torch.max(vec, 1)
@@ -23,6 +23,7 @@ def log_sum_exp(vec):
     max_score_broadcast = max_score.view(1, -1).expand(1, vec.size()[1])
     return max_score + \
         torch.log(torch.sum(torch.exp(vec - max_score_broadcast)))
+
 
 class BiLSTM_CRF(nn.Module):
 
@@ -157,11 +158,10 @@ class BiLSTM_CRF(nn.Module):
         return forward_score - gold_score
 
     def batch_loss(self, sentences, labels):
-        size = len(sentences)
-        total_loss = 0
-        for i in range(size):
-            total_loss += self.neg_log_likelihood(sentences[i], labels[i])
-        return total_loss/size
+        result = torch.zeros(len(sentences))
+        for i in range(len(sentences)):
+            result[i] = self.neg_log_likelihood(sentences[i], labels[i])
+        return torch.mean(result)
 
     def forward(self, sentence):  # dont confuse this with _forward_alg above.
         # Get the emission scores from the BiLSTM

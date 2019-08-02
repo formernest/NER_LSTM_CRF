@@ -39,6 +39,12 @@ tag2id[STOP_TAG] = len(tag2id)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(device)
 
+x_train = x_train[:10000]
+y_train = y_train[:10000]
+
+x_test = x_test[:1000]
+y_test = y_test[:1000]
+
 
 def train():
 
@@ -49,13 +55,13 @@ def train():
     sentence = torch.tensor(x_train, dtype=torch.long).to(device)
     y_train1 = [[tag2id[y_train[i][j]] for j in range(len(y_train[i]))] for i in range(len(y_train))]
     tags = torch.tensor(y_train1, dtype=torch.long).to(device)
-    trainloader = DataLoader(TensorDataset(sentence, tags), batch_size=batch_size, shuffle=True)
+    trainloader = DataLoader(TensorDataset(sentence, tags), batch_size=batch_size, shuffle=True, drop_last=True)
 
     # test_data
     sentence = torch.tensor(x_test, dtype=torch.long).to(device)
     y_test1 = [[tag2id[y_test[i][j]] for j in range(len(y_test[i]))] for i in range(len(y_test))]
     tags = torch.tensor(y_test1, dtype=torch.long).to(device)
-    testloader = DataLoader(TensorDataset(sentence, tags), batch_size=batch_size, shuffle=True)
+    testloader = DataLoader(TensorDataset(sentence, tags), batch_size=batch_size, shuffle=True, drop_last=True)
     print("train start:", datetime.datetime.now())
     # 训练
     for epoch in range(EPOCHS):
@@ -65,33 +71,32 @@ def train():
             loss = model.batch_loss(sentences, labels)
             loss.backward()
             optimizer.step()
-            if batch % 10 == 0:
+            if batch % 20 == 0 and batch > 0:
                 print("epoch:", epoch, "batch:", batch, 'current time:', datetime.datetime.now())
 
         # 用来保存测试结果
         entityres = []
         entityall = []
         # 每个epoch后测试一下
-        with torch.no_grad():
-            print('test start:', datetime.datetime.now())
-            for batch, data in enumerate(testloader, 0):
-                sentences, labels = data
-                for i in range(len(sentences)):
-                    scores, predicts = model(sentences[i])
-                    entityres = calculate(sentences[i], predicts, id2word, id2tag, entityres)
-                    entityall = calculate(sentences[i], labels[i].numpy(), id2word, id2tag, entityall)
+        print('test start:', datetime.datetime.now())
+        for batch, data in enumerate(testloader, 0):
+            sentences, labels = data
+            for sentence, label in zip(sentences, labels):
+                score, predict = model(sentence)
+                entityres = calculate(sentence, predict, id2word, id2tag, entityres)
+                entityall = calculate(sentence, label, id2word, id2tag, entityall)
 
-            jiaoji = [i for i in entityres if i in entityall]
-            if len(jiaoji) != 0:
-                zhun = float(len(jiaoji)) / len(entityres)  # 准确率
-                zhao = float(len(jiaoji)) / len(entityall)  # 召回率
-                print("test:")
-                print("precision:", zhun)
-                print("recall:", zhao)
-                print("F:", (2 * zhun * zhao) / (zhun + zhao))
-            else:
-                print("precision:", 0)
-            print('test end:', datetime.datetime.now())
+        jiaoji = [i for i in entityres if i in entityall]
+        if len(jiaoji) != 0:
+            zhun = float(len(jiaoji)) / len(entityres)  # 准确率
+            zhao = float(len(jiaoji)) / len(entityall)  # 召回率
+            print("test:")
+            print("precision:", zhun)
+            print("recall:", zhao)
+            print("F:", (2 * zhun * zhao) / (zhun + zhao))
+        else:
+            print("precision:", 0)
+        print('test end:', datetime.datetime.now())
 
     print('train finished:', datetime.datetime.now())
 
@@ -122,6 +127,12 @@ def test():
         print("f:", (2 * zhun * zhao) / (zhun + zhao))
     else:
         print("zhun:", 0)
+
+
+def predict(sentence):
+    path = './model/model.pkl'
+    model = torch.load(path)
+
 
 
 train()
